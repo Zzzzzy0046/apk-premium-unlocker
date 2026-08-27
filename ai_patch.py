@@ -9,6 +9,7 @@ AI 补丁引擎（DeepSeek 规划 + 工具执行）。
 import os
 import re
 import json
+import zipfile
 import urllib.request
 
 DEEPSEEK_URL = "https://api.deepseek.com/chat/completions"
@@ -21,6 +22,7 @@ CONFIG_FILE = os.path.join(
 SDK_SIGNATURES = [
     ("adaptytech", "Adapty"),
     ("revenuecat", "RevenueCat"),
+    ("superwall", "Superwall"),
     ("qonversion", "Qonversion"),
     ("apphud", "Apphud"),
     ("purchasely", "Purchasely"),
@@ -176,7 +178,7 @@ def _premium_strings(apktool_out, limit=60):
     return out
 
 
-def collect_candidates(apktool_out, log, max_files=16, ctx_bytes=70000):
+def collect_candidates(apktool_out, log, max_files=16, ctx_bytes=70000, progress=None):
     """多信号源收集订阅/premium 判断候选片段（限长）。"""
     parts = []
     total = 0
@@ -197,11 +199,15 @@ def collect_candidates(apktool_out, log, max_files=16, ctx_bytes=70000):
     if strs:
         add("premium 相关字符串（strings.xml）", "\n".join(strs))
         log("[AI] 提取 premium 字符串 %d 条" % len(strs))
+    if progress:
+        progress(5)
 
     # 2) smali 多信号扫描，收集 (path, line, reason)
     hits = []  # (path, line_no, reason)
     log("[AI] 扫描 smali 订阅判断候选（多信号）...")
-    for p in _iter_smali(apktool_out):
+    smali_files = list(_iter_smali(apktool_out))
+    total_files = max(1, len(smali_files))
+    for fi, p in enumerate(smali_files, 1):
         try:
             with open(p, encoding="utf-8", errors="replace") as f:
                 for i, line in enumerate(f):
@@ -227,6 +233,8 @@ def collect_candidates(apktool_out, log, max_files=16, ctx_bytes=70000):
                         break
         except Exception:
             continue
+        if progress and (fi == total_files or fi % 200 == 0):
+            progress(5 + int(fi * 40 / total_files))
         if len(hits) >= 400:
             break
     if not hits:
@@ -366,7 +374,7 @@ def apply_patches(apktool_out, plan, log):
     return applied
 
 
-def run(apktool_out, log):
+def run(apktool_out, log, progress=None):
     """AI 解锁入口：收集上下文 → DeepSeek 规划 → 应用补丁。"""
     cfg = load_config()
     key = cfg.get("deepseek_key")
@@ -375,7 +383,7 @@ def run(apktool_out, log):
         return False
     log("[AI] 开始 AI 订阅解锁分析（DeepSeek %s）..." % (cfg.get("model") or DEFAULT_MODEL))
     sdks = detect_sdks(apktool_out, log)
-    parts, err = collect_candidates(apktool_out, log)
+    parts, err = collect_candidates(apktool_out, log, progress=progress)
     if err:
         log("[AI] %s" % err)
         return False
@@ -386,6 +394,8 @@ def run(apktool_out, log):
             % ("、".join(sdks) if sdks else "未知（可能直连 Billing / 服务端 entitlement / 广告解锁）",
                "\n".join(parts)))
     log("[AI] 请求 DeepSeek 规划补丁 ...")
+    if progress:
+        progress(70)
     raw = ask_deepseek(key, cfg.get("model"), user, log)
     if raw is None:
         return False
@@ -393,5 +403,7 @@ def run(apktool_out, log):
     if plan is None:
         return False
     n = apply_patches(apktool_out, plan, log)
+    if progress:
+        progress(100)
     log("[AI] AI 补丁完成: 应用 %d 处。%s" % (n, plan.get("summary", "")))
     return n > 0

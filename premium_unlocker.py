@@ -24,8 +24,10 @@ import zipfile
 from datetime import datetime
 
 import ai_patch
+import sdk_patches
+import frida_mode
 
-VERSION = "1.1"
+VERSION = "1.3"
 APKTOOL_URL = "https://github.com/iBotPeaches/Apktool/releases/download/v2.9.3/apktool_2.9.3.jar"
 APKTOOL_FILENAME = "apktool.jar"
 LOG_FILE = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")),
@@ -112,6 +114,169 @@ def emit_log(msg):
         LOG_BUFFER.append((LOG_SEQ[0], msg))
         if len(LOG_BUFFER) > 2000:
             del LOG_BUFFER[:1000]
+
+
+# ---------------------------------------------------------------- 运行状态（Web UI 步进器）
+
+# 主流程阶段（key, 显示名）。set_stage 只允许推进，错误时 mark_failed。
+STAGES = [
+    ("init", "初始化"),
+    ("unpack", "解包"),
+    ("decompile", "反编译"),
+    ("patch", "补丁"),
+    ("build", "重打包"),
+    ("sign", "签名"),
+    ("install", "安装"),
+    ("verify", "验证"),
+]
+
+# Frida 模式的阶段（不反编译/重打包，走动态 hook）
+FRIDA_STAGES = [
+    ("init", "初始化"),
+    ("unpack", "解包"),
+    ("detect", "检测 SDK"),
+    ("script", "生成脚本"),
+    ("deploy", "部署 frida-server"),
+    ("run", "注入运行"),
+    ("verify", "验证"),
+]
+
+STATE = None          # None = 空闲；dict = 一次运行的状态快照
+_STATE_LOCK = threading.Lock()
+_STATE_LOG = None     # 当前运行的日志函数（set_stage 时打印阶段提示）
+
+
+def _default_state_log(msg):
+    emit_log(msg)
+
+
+def get_state_snapshot():
+    """线程安全地返回当前状态副本。空闲时返回 idle 快照。"""
+    with _STATE_LOCK:
+        if not STATE:
+            return {"app": "premium-unlocker", "running": False, "finished": None,
+                    "stage": None, "stage_idx": 0,
+                    "stage_names": [n for _, n in STAGES],
+                    "stage_status": ["pending"] * len(STAGES),
+                    "progress": 0, "elapsed": 0, "stage_elapsed": 0, "error": None}
+        now = time.time()
+        stage_idx = STATE["stage_idx"]
+        st = {
+            "app": "premium-unlocker",
+            "running": STATE["running"],
+            "finished": STATE.get("finished"),
+            "stage": STATE["stage_keys"][stage_idx],
+            "stage_idx": stage_idx,
+            "stage_names": list(STATE["stage_names"]),
+            "stage_status": [STATE["stages"][k] for k in STATE["stage_keys"]],
+            "progress": STATE["progress"],
+            "elapsed": max(0, int(now - STATE["start"])),
+            "stage_elapsed": max(0, int(now - STATE.get("stage_start", STATE["start"]))),
+            "error": STATE.get("error"),
+        }
+        return st
+
+
+def _reset_state(stages=None):
+    global STATE
+    with _STATE_LOCK:
+        st = list(stages) if stages else STAGES
+        STATE = {
+            "running": True,
+            "finished": None,
+            "stage_idx": 0,
+            "stage_start": time.time(),
+            "start": time.time(),
+            "stage_keys": [k for k, _ in st],
+            "stage_names": [n for _, n in st],
+            "stages": {k: "pending" for k, _ in st},
+            "progress": 0,
+            "error": None,
+        }
+
+
+def set_stage(stage_key, log=None):
+    """推进到指定阶段。之前的阶段标记为 done（除非已 failed/skipped）。"""
+    global STATE, _STATE_LOG
+    if log is not None:
+        _STATE_LOG = log
+    if not STATE:
+        _reset_state()
+    with _STATE_LOCK:
+        try:
+            idx = STATE["stage_keys"].index(stage_key)
+        except ValueError:
+            return
+        # 当前阶段（若仍 running/pending）→ done；中间阶段 → done；目标阶段 → running
+        cur = STATE["stage_keys"][STATE["stage_idx"]]
+        if STATE["stage_idx"] != idx and STATE["stages"].get(cur) in ("running", "pending"):
+            STATE["stages"][cur] = "done"
+        for i in range(STATE["stage_idx"] + 1, idx):
+            k = STATE["stage_keys"][i]
+            if STATE["stages"][k] == "pending":
+                STATE["stages"][k] = "done"
+        STATE["stages"][stage_key] = "running"
+        STATE["stage_idx"] = idx
+        STATE["stage_start"] = time.time()
+        STATE["progress"] = 0
+        total = len(STATE["stage_keys"])
+        name = STATE["stage_names"][idx]
+    (log or _STATE_LOG or _default_state_log)("[阶段 %d/%d] %s" % (idx + 1, total, name))
+
+
+def mark_stage(stage_key, status):
+    """把某阶段标记为 done / failed / skipped。"""
+    global STATE
+    with _STATE_LOCK:
+        if not STATE:
+            return
+        STATE["stages"][stage_key] = status
+        if status == "failed" and not STATE["error"]:
+            STATE["error"] = stage_key
+
+
+def report_progress(pct):
+    """当前阶段进度 0-100（如 apktool 无法给进度，UI 显示动画）。"""
+    global STATE
+    with _STATE_LOCK:
+        if STATE:
+            STATE["progress"] = max(0, min(100, int(pct)))
+
+
+def _set_error(msg):
+    """记录错误文案（UI 状态栏显示）。"""
+    global STATE
+    with _STATE_LOCK:
+        if STATE:
+            STATE["error"] = msg
+
+
+def _finish_state(ok):
+    global STATE
+    with _STATE_LOCK:
+        if not STATE:
+            return
+        keys = STATE["stage_keys"]
+        names = STATE["stage_names"]
+        cur = keys[STATE["stage_idx"]]
+        if ok:
+            if STATE["stages"].get(cur) == "running":
+                STATE["stages"][cur] = "done"
+            STATE["finished"] = "ok"
+        else:
+            # 找到 failed 的阶段名生成错误信息；当前阶段仍 running 则标记 failed
+            failed_name = None
+            for k, n in zip(keys, names):
+                if STATE["stages"].get(k) == "failed":
+                    failed_name = n
+                    break
+            if STATE["stages"].get(cur) == "running":
+                STATE["stages"][cur] = "failed"
+                failed_name = failed_name or names[STATE["stage_idx"]]
+            if not STATE["error"]:
+                STATE["error"] = "错误：" + (failed_name or names[STATE["stage_idx"]]) + "阶段失败"
+            STATE["finished"] = "failed"
+        STATE["running"] = False
 
 # ---------------------------------------------------------------- 工具定位
 
@@ -325,13 +490,18 @@ def pick_splits(splits, abilist, density):
 
 # ---------------------------------------------------------------- 解包
 
-def unpack_input(path, workdir, log):
+def unpack_input(path, workdir, log, progress=None):
     """返回 (base_apk, splits_dict)。splits_dict: {id: path}"""
     low = path.lower()
     if low.endswith((".xapk", ".zip")):
         log("解包 %s ..." % os.path.basename(path))
         with zipfile.ZipFile(path) as z:
-            z.extractall(workdir)
+            names = z.namelist()
+            total = len(names)
+            for i, n in enumerate(names, 1):
+                z.extract(n, workdir)
+                if progress and (i == total or i % max(1, total // 20) == 0):
+                    progress(int(i * 100 / total))
         manifest = os.path.join(workdir, "manifest.json")
         base = None
         if os.path.isfile(manifest):
@@ -349,11 +519,15 @@ def unpack_input(path, workdir, log):
             if f.startswith("config.") and f.endswith(".apk"):
                 splits[f[:-4]] = os.path.join(workdir, f)
         log("base: %s，split 数: %d" % (os.path.basename(base) if base else "无", len(splits)))
+        if progress:
+            progress(100)
         return base, splits
     else:
         dest = os.path.join(workdir, "base.apk")
         shutil.copyfile(path, dest)
         log("单 APK 输入: %s" % os.path.basename(path))
+        if progress:
+            progress(100)
         return dest, {}
 
 
@@ -407,13 +581,15 @@ def _inject_missing_attrs(outdir, names, log):
     return bool(added)
 
 
-def build(apktool, outdir, repack, log):
+def build(apktool, outdir, repack, log, progress=None):
     log("apktool 重打包 ...")
     for attempt in range(6):
         r = _run([find_java(), "-Xmx4g", "-jar", apktool, "b", outdir, "-o", repack],
                  timeout=900)
         if r.returncode == 0:
             log("   已生成: %s" % repack)
+            if progress:
+                progress(100)
             return True
         out = (r.stdout or "") + (r.stderr or "")
         # AI 补丁写出非法 smali → 回滚 AI 补丁后重试（pairip/资源补丁不受影响）
@@ -479,150 +655,6 @@ def patch_pairip(outdir, log):
         log("[pairip] 未检测到 pairip")
 
 
-# ---------------------------------------------------------------- patch: Adapty
-
-def _patch_getter(smali_path, class_desc, log, tag):
-    """把 isActive()Z / getIsActive()Z getter 改成恒 true。"""
-    if not os.path.isfile(smali_path):
-        log("[%s] 文件不存在，跳过" % tag)
-        return 0
-    with open(smali_path, encoding="utf-8") as f:
-        lines = f.readlines()
-    patched = 0
-    in_method = False
-    for i, line in enumerate(lines):
-        if re.search(r"\.method.*\s(isActive|getIsActive)\(\)Z", line):
-            in_method = True
-            continue
-        if in_method and line.strip() == ".end method":
-            in_method = False
-            continue
-        if in_method:
-            m = re.match(r"(\s*)iget-boolean\s+(\w+),\s*p0,\s*" + re.escape(class_desc)
-                         + r"->isActive:Z", line)
-            if m:
-                lines[i] = "%sconst/4 %s, 0x1\n" % (m.group(1), m.group(2))
-                patched += 1
-                log("[%s] getter 恒 true: 行 %d" % (tag, i + 1))
-    if patched:
-        with open(smali_path, "w", encoding="utf-8") as f:
-            f.writelines(lines)
-    else:
-        log("[%s] 未找到 isActive getter（SDK 版本差异？）" % tag)
-    return patched
-
-
-def _patch_null_branch(outdir, log):
-    """
-    修 map builder 的 null 分支：
-    找到含 `AccessLevel;->isActive()Z` 的方法；在 isActive 的 move-result 与
-    Boolean.valueOf 之间，若存在条件跳转到某个 label，且该 label 下第一句是
-    `move V, W`（W 在本方法中被 const/4 赋过 0），则把该句改成 const/4 V, 0x1。
-    """
-    patched_files = 0
-    for root, _, files in os.walk(outdir):
-        for fn in files:
-            if not fn.endswith(".smali"):
-                continue
-            p = os.path.join(root, fn)
-            try:
-                with open(p, encoding="utf-8") as f:
-                    txt = f.read()
-            except Exception:
-                continue
-            if "AccessLevel;->isActive()Z" not in txt:
-                continue
-            # 切方法
-            methods = re.split(r"(\.method[^\n]*\n)", txt)
-            changed = False
-            for mi in range(1, len(methods), 2):
-                header = methods[mi]
-                body = methods[mi + 1]
-                if "isActive()Z" not in body or "Boolean;->valueOf" not in body:
-                    continue
-                # 本方法内被赋过 0 的寄存器
-                zero_regs = set(re.findall(r"const/4\s+(\w+),\s*0x?0\b", body))
-                if not zero_regs:
-                    continue
-                body_lines = body.splitlines(keepends=True)
-                # 找 isActive 的 move-result 寄存器 → valueOf 寄存器
-                for i, line in enumerate(body_lines):
-                    m = re.search(r"AccessLevel;->isActive\(\)Z", line)
-                    if not m:
-                        continue
-                    res_reg = None
-                    for j in range(i + 1, min(i + 6, len(body_lines))):
-                        m2 = re.match(r"\s*move-result\s+(\w+)", body_lines[j])
-                        if m2:
-                            res_reg = m2.group(1)
-                            break
-                    if not res_reg:
-                        continue
-                    # valueOf 用同一个寄存器？
-                    valof_idx = None
-                    for j in range(i + 1, min(i + 40, len(body_lines))):
-                        if "Boolean;->valueOf" in body_lines[j]:
-                            valof_idx = j
-                            break
-                    if valof_idx is None:
-                        continue
-                    # 收集 isActive → valueOf 窗口内的跳转 label
-                    window = body_lines[i:valof_idx + 1]
-                    labels = set()
-                    for wl in window:
-                        m3 = re.match(r"\s*(:[\w_]+)", wl)
-                        if m3:
-                            labels.add(m3.group(1))
-                    if not labels:
-                        continue
-                    # 找 label 下紧跟的 move V, W
-                    for j, wl in enumerate(body_lines[i:valof_idx + 1], start=i):
-                        m4 = re.match(r"(\s*)(:[\w_]+)\s*$", wl)
-                        if not m4 or m4.group(2) not in labels:
-                            continue
-                        if j + 1 >= len(body_lines):
-                            continue
-                        m5 = re.match(r"(\s*)move\s+(\w+),\s*(\w+)", body_lines[j + 1])
-                        if not m5:
-                            continue
-                        if m5.group(2) != res_reg or m5.group(3) not in zero_regs:
-                            continue
-                        body_lines[j + 1] = "%sconst/4 %s, 0x1\n" % (m5.group(1), res_reg)
-                        changed = True
-                        methods[mi + 1] = "".join(body_lines)
-                        log("[Adapty] null 分支恒 true: %s 行 %d (方法 %s)"
-                            % (os.path.relpath(p, outdir), j + 2, header.strip()[:80]))
-                        break
-            if changed:
-                with open(p, "w", encoding="utf-8") as f:
-                    f.write("".join(methods))
-                patched_files += 1
-    if not patched_files:
-        log("[Adapty] 未定位到 null 分支（新用户 profile 无 premium level 时可能仍显示未订阅）")
-    return patched_files
-
-
-def patch_adapty(outdir, log):
-    for root, _, files in os.walk(outdir):
-        for fn in files:
-            if fn == "AdaptyProfile$AccessLevel.smali" and "adapty" in root.replace(os.sep, "/"):
-                _patch_getter(os.path.join(root, fn),
-                              "Lcom/adapty/models/AdaptyProfile$AccessLevel;",
-                              log, "Adapty/AccessLevel")
-            if fn == "AdaptyProfile$Subscription.smali" and "adapty" in root.replace(os.sep, "/"):
-                _patch_getter(os.path.join(root, fn),
-                              "Lcom/adapty/models/AdaptyProfile$Subscription;",
-                              log, "Adapty/Subscription")
-    _patch_null_branch(outdir, log)
-
-
-def has_adapty(outdir):
-    for root, _, files in os.walk(outdir):
-        if "adapty" in root.replace(os.sep, "/").lower() and files:
-            return True
-    return False
-
-
 def patch_force_single(outdir, log):
     """强制单包模式：删除 manifest 的 splits-required 声明，让 base 单装。
     警告：AAB 拆分的原生库/资源在 split 里，单装可能崩溃，仅作兜底。"""
@@ -649,9 +681,10 @@ def patch_force_single(outdir, log):
 
 # ---------------------------------------------------------------- 签名 / 安装 / 验证
 
-def sign_all(apksigner, keystore, files, log):
+def sign_all(apksigner, keystore, files, log, progress=None):
     ok = True
-    for f in files:
+    total = len(files)
+    for i, f in enumerate(files, 1):
         log("签名 %s ..." % os.path.basename(f))
         if apksigner.lower().endswith(".jar"):
             base_cmd = [find_java(), "-jar", apksigner, "sign"]
@@ -663,6 +696,8 @@ def sign_all(apksigner, keystore, files, log):
                                 "--key-pass", "pass:android", f],
                     log, timeout=300)
         ok = ok and r
+        if progress:
+            progress(int(i * 100 / total))
     return ok
 
 
@@ -682,7 +717,7 @@ def get_package_name(outdir):
     return None
 
 
-def install(adb, serial, pkg, signed_dir, log):
+def install(adb, serial, pkg, signed_dir, log, progress=None):
     files = sorted(os.path.join(signed_dir, f) for f in os.listdir(signed_dir)
                    if f.endswith(".apk"))
     if not files:
@@ -694,12 +729,16 @@ def install(adb, serial, pkg, signed_dir, log):
     cmd += ["uninstall", pkg]
     _run(cmd, timeout=120)
     log("卸载旧版完成（如存在）")
+    if progress:
+        progress(20)
     cmd = [adb]
     if serial:
         cmd += ["-s", serial]
     cmd += ["install-multiple"] + files
     log("安装 %d 个 APK ..." % len(files))
     ok = run_cmd(cmd, log, timeout=600)
+    if progress:
+        progress(ok and 100 or 90)
     if not ok:
         r2 = _run(cmd, timeout=600)
         out = (r2.stdout or "") + (r2.stderr or "")
@@ -714,14 +753,17 @@ def install(adb, serial, pkg, signed_dir, log):
     return ok
 
 
-def launch_verify(adb, serial, pkg, log):
+def launch_verify(adb, serial, pkg, log, progress=None):
     cmd = [adb]
     if serial:
         cmd += ["-s", serial]
     _run(cmd + ["shell", "monkey", "-p", pkg,
               "-c", "android.intent.category.LAUNCHER", "1"], timeout=60)
     log("已启动，等待 12 秒观察 ...")
-    time.sleep(12)
+    for i in range(12):
+        time.sleep(1)
+        if progress:
+            progress(int((i + 1) * 100 / 12))
     r = _run(cmd + ["shell", "pidof", pkg], timeout=30)
     alive = bool(r.stdout.strip())
     log("进程存活: %s" % ("是" if alive else "否"))
@@ -743,103 +785,260 @@ class Unlocker:
     def __init__(self, log):
         self.log = log
 
-    def run(self, input_path, install_flag, force_single=False):
-        self.log("=" * 56)
-        self.log("开始处理: %s" % input_path)
-        if not os.path.isfile(input_path):
-            self.log("文件不存在")
+    def _fail(self, stage_key, msg):
+        self.log(msg)
+        _set_error(msg)
+        mark_stage(stage_key, "failed")
+
+    def _setup_dirs(self, input_path):
+        base_dir = os.path.dirname(os.path.abspath(input_path))
+        stem = os.path.splitext(os.path.basename(input_path))[0]
+        out_root = os.path.join(base_dir, stem + "_unlocked")
+        workdir = os.path.join(out_root, "work")
+        for d in (workdir, os.path.join(out_root, "signed")):
+            os.makedirs(d, exist_ok=True)
+        return out_root, workdir
+
+    def _pkg_from_manifest(self, workdir):
+        m = os.path.join(workdir, "manifest.json")
+        if os.path.isfile(m):
+            try:
+                with open(m, encoding="utf-8") as f:
+                    mj = json.load(f)
+                pn = mj.get("package_name") or mj.get("packageName")
+                if pn:
+                    self.log("[Frida] 从 manifest.json 取到包名: %s" % pn)
+                    return pn
+            except Exception:
+                pass
+        return None
+
+    def _pkg_installed(self, adb, serial, pkg):
+        cmd = [adb] + (["-s", serial] if serial else [])
+        r = _run(cmd + ["shell", "pm", "list", "packages", pkg], timeout=30)
+        return pkg in r.stdout
+
+    # ---------------- Frida 模式（第 3 层，动态 hook，不改包） ----------------
+
+    def _run_frida(self, input_path, install_flag, pkg, progress):
+        _reset_state(FRIDA_STAGES)
+        set_stage("init", self.log)
+        adb = find_adb()
+        if not adb:
+            self._fail("init", "错误：未找到 adb（Frida 模式需要设备连接）")
+            _finish_state(False)
+            return
+        progress(50)
+
+        set_stage("unpack", self.log)
+        out_root, workdir = self._setup_dirs(input_path)
+        base_apk, _splits = unpack_input(input_path, workdir, self.log, progress)
+        if not base_apk or not os.path.isfile(base_apk):
+            self._fail("unpack", "错误：解包失败，未找到 base APK")
+            _finish_state(False)
+            return
+        if not pkg:
+            pkg = self._pkg_from_manifest(workdir)
+        if not pkg:
+            self._fail("unpack", "错误：Frida 模式需要包名，请在页面输入框填写（如 com.xxx.yyy）")
+            _finish_state(False)
             return
 
+        set_stage("detect", self.log)
+        sdks = frida_mode.detect_from_apk(base_apk)
+        if sdks:
+            self.log("[Frida] dex 检测到 SDK: %s" % "、".join(sdks))
+        else:
+            self.log("[Frida] 未识别订阅 SDK，将只用通用缓存 hook（SharedPreferences/RemoteConfig）")
+        progress(70)
+
+        set_stage("script", self.log)
+        script_path = os.path.join(out_root, "frida_script.js")
+        frida_mode.write_script(sdks, pkg, script_path, self.log)
+        progress(100)
+
+        if not frida_mode.frida_available():
+            self.log("[Frida] 本机未打包 frida 客户端。脚本已生成，手动跑法：")
+            self.log("    pip install frida-tools")
+            self.log('    frida -U -f %s -l "%s" --no-pause' % (pkg, script_path))
+            mark_stage("deploy", "skipped")
+            mark_stage("run", "skipped")
+            mark_stage("verify", "skipped")
+            self.log("完成（仅生成脚本）。")
+            _finish_state(True)
+            return
+
+        set_stage("deploy", self.log)
+        adb2, serial = get_device()
+        if not adb2 or not serial:
+            self._fail("deploy", "未检测到设备（Frida 模式需要 USB 连接且设备已 root）")
+            _finish_state(False)
+            return
+        ok, note = frida_mode.deploy_frida_server(adb2, serial, self.log)
+        if not ok:
+            self._fail("deploy", "frida-server 部署失败（%s）" % note)
+            _finish_state(False)
+            return
+        progress(100)
+
+        set_stage("run", self.log)
+        if install_flag and not self._pkg_installed(adb2, serial, pkg):
+            self.log("[Frida] 设备上未安装 %s，先装原始 APK" % pkg)
+            if not install(adb2, serial, pkg, workdir, self.log, progress):
+                self._fail("run", "错误：安装原始 APK 失败")
+                _finish_state(False)
+                return
+        if not frida_mode.run_hook(pkg, script_path, self.log):
+            self._fail("run", "错误：Frida 注入失败（详见日志）")
+            _finish_state(False)
+            return
+
+        set_stage("verify", self.log)
+        self.log("已启动，等待 12 秒观察 ...")
+        for i in range(12):
+            time.sleep(1)
+            progress(int((i + 1) * 100 / 12))
+        cmd = [adb2] + (["-s", serial] if serial else [])
+        r = _run(cmd + ["shell", "pidof", pkg], timeout=30)
+        alive = bool(r.stdout.strip())
+        self.log("进程存活: %s" % ("是" if alive else "否"))
+        self.log("完成。Hook 保持运行中，关闭工具即结束。")
+        _finish_state(True)
+
+    # ---------------- 主流程（重打包） ----------------
+
+    def run(self, input_path, install_flag, force_single=False, progress=None,
+            frida=False, pkg=None):
+        progress = progress or report_progress
+        self.log("=" * 56)
+        self.log("开始处理: %s%s" % (input_path, "（Frida 模式）" if frida else ""))
+        if frida:
+            self._run_frida(input_path, install_flag, pkg, progress)
+            return
+        _reset_state()
+        if not os.path.isfile(input_path):
+            self._fail("init", "文件不存在: %s" % input_path)
+            _finish_state(False)
+            return
+
+        set_stage("init", self.log)
         ensure_runtime(self.log)
+        progress(15)
 
         java = find_java()
         if not java:
-            self.log("错误：未找到 Java（需要 Java 17+）")
+            self._fail("init", "错误：未找到 Java（需要 Java 17+）")
+            _finish_state(False)
             return
         apktool = find_apktool(self.log)
         if not apktool:
-            self.log("错误：apktool 不可用")
+            self._fail("init", "错误：apktool 不可用")
+            _finish_state(False)
             return
+        progress(45)
         apksigner = find_apksigner()
         if not apksigner:
-            self.log("错误：未找到 apksigner（Android SDK build-tools）")
+            self._fail("init", "错误：未找到 apksigner（Android SDK build-tools）")
+            _finish_state(False)
             return
         keystore = ensure_debug_keystore(self.log)
+        progress(70)
 
         res = (ensure_runtime() or "").replace("\\", "/")
         def src(p):
             return "内置" if p and res and res in p.replace("\\", "/") else "系统"
         self.log("运行时解析: java[%s] apktool[%s] apksigner[%s] keystore[%s]"
                  % (src(java), src(apktool), src(apksigner), src(keystore)))
+        progress(100)
 
-        base_dir = os.path.dirname(os.path.abspath(input_path))
-        stem = os.path.splitext(os.path.basename(input_path))[0]
-        out_root = os.path.join(base_dir, stem + "_unlocked")
-        workdir = os.path.join(out_root, "work")
+        out_root, workdir = self._setup_dirs(input_path)
         apk_out = os.path.join(out_root, "apktool_out")
         signed_dir = os.path.join(out_root, "signed")
         repack = os.path.join(out_root, "base_patched.apk")
-        for d in (workdir, signed_dir):
-            os.makedirs(d, exist_ok=True)
 
         # 1 解包
-        base_apk, splits = unpack_input(input_path, workdir, self.log)
+        set_stage("unpack", self.log)
+        base_apk, splits = unpack_input(input_path, workdir, self.log, progress)
         if not base_apk or not os.path.isfile(base_apk):
-            self.log("错误：解包失败，未找到 base APK")
+            self._fail("unpack", "错误：解包失败，未找到 base APK")
+            _finish_state(False)
             return
 
         # 2 反编译
+        set_stage("decompile", self.log)
         if not decompile(apktool, base_apk, apk_out, self.log):
-            self.log("错误：反编译失败")
+            self._fail("decompile", "错误：反编译失败")
+            _finish_state(False)
             return
 
-        # 3 patch
+        # 3 patch：pairip → 三层确定性补丁（SDK 模板 / 缓存层 / 判断链）→ AI 兜底
+        set_stage("patch", self.log)
         patch_pairip(apk_out, self.log)
+        progress(15)
         if force_single:
             patch_force_single(apk_out, self.log)
-        if has_adapty(apk_out):
-            self.log("[Adapty] 检测到 Adapty SDK，应用订阅解锁补丁")
-            patch_adapty(apk_out, self.log)
+        sdks, patched = sdk_patches.apply_all(apk_out, self.log, progress)
+        if patched == 0 and ai_patch.has_ai():
+            self.log("[AI] 确定性补丁无命中，调用 DeepSeek 分析补丁方案")
+            ai_patch.run(apk_out, self.log, progress)
+        elif patched == 0:
+            self.log("[补丁] 确定性补丁无命中；未配置 DeepSeek Key，跳过订阅补丁"
+                     "（仅 pairip 绕过）。可在页面下方配置 Key 后重跑")
         else:
-            self.log("[Adapty] 未检测到 Adapty SDK")
-            if ai_patch.has_ai():
-                self.log("[AI] 订阅 SDK 非 Adapty，调用 DeepSeek 分析补丁方案")
-                ai_patch.run(apk_out, self.log)
-            else:
-                self.log("[AI] 未配置 DeepSeek Key，跳过订阅补丁（仅 pairip 绕过）。"
-                         "可在页面下方配置 Key 后重跑，解锁非 Adapty 订阅")
+            self.log("[补丁] 确定性补丁完成: %d 处（SDK: %s）"
+                     % (patched, "、".join(sdks) if sdks else "无"))
+        pkg = get_package_name(apk_out)
 
-        # 4 重打包
-        if not build(apktool, apk_out, repack, self.log):
-            self.log("错误：重打包失败")
+        # 4 重打包（失败自动生成 Frida 脚本备用）
+        set_stage("build", self.log)
+        if not build(apktool, apk_out, repack, self.log, progress):
+            try:
+                sdks_dex = frida_mode.detect_from_apk(base_apk)
+                fpath = os.path.join(out_root, "frida_script.js")
+                frida_mode.write_script(sdks_dex, pkg or "", fpath, self.log)
+                self.log("[Frida] 重打包失败的包可在 root 设备上动态 hook"
+                         "（页面勾选 Frida 模式一键跑，包名 %s）" % (pkg or "待填"))
+            except Exception as e:
+                self.log("[Frida] 生成备用脚本失败: %s" % e)
+            self._fail("build", "错误：重打包失败（可能签名校验/加固，可勾选 Frida 模式重试）")
+            _finish_state(False)
             return
 
         # 5 签名
+        set_stage("sign", self.log)
         shutil.copyfile(repack, os.path.join(signed_dir, "base.apk"))
         for sid, sp in splits.items():
             shutil.copyfile(sp, os.path.join(signed_dir, sid + ".apk"))
         sign_files = [os.path.join(signed_dir, f) for f in os.listdir(signed_dir)
                       if f.endswith(".apk")]
-        if not sign_all(apksigner, keystore, sign_files, self.log):
-            self.log("错误：签名失败")
+        if not sign_all(apksigner, keystore, sign_files, self.log, progress):
+            self._fail("sign", "错误：签名失败")
+            _finish_state(False)
             return
         self.log("✔ 补丁包已生成: %s" % signed_dir)
 
         # 6 安装 + 验证
-        pkg = get_package_name(apk_out)
         if install_flag:
+            set_stage("install", self.log)
             adb, serial = get_device()
             if not adb or not serial:
                 self.log("未检测到设备，跳过安装。可手动: adb install-multiple signed/*.apk")
+                mark_stage("install", "skipped")
+                mark_stage("verify", "skipped")
             else:
                 abilist, density = device_props(adb, serial)
-                if not install(adb, serial, pkg, signed_dir, self.log):
-                    self.log("错误：安装失败")
+                if not install(adb, serial, pkg, signed_dir, self.log, progress):
+                    self._fail("install", "错误：安装失败")
+                    _finish_state(False)
                     return
-                launch_verify(adb, serial, pkg, self.log)
+                set_stage("verify", self.log)
+                launch_verify(adb, serial, pkg, self.log, progress)
         else:
             self.log("（跳过安装，仅生成补丁包）")
+            mark_stage("install", "skipped")
+            mark_stage("verify", "skipped")
         self.log("完成。")
+        _finish_state(True)
 
 
 # ---------------------------------------------------------------- GUI
@@ -863,7 +1062,13 @@ def main():
         path = sys.argv[idx + 1]
         install = "--no-install" not in sys.argv
         force = "--force-single" in sys.argv
-        Unlocker(CLILog()).run(path, install, force)
+        frida = "--frida" in sys.argv
+        pkg = None
+        if "--pkg" in sys.argv:
+            p = sys.argv.index("--pkg")
+            if p + 1 < len(sys.argv):
+                pkg = sys.argv[p + 1]
+        Unlocker(CLILog()).run(path, install, force, frida=frida, pkg=pkg)
         return
     ensure_runtime(None)
     emit_log("工具启动 v%s（Web UI）" % VERSION)

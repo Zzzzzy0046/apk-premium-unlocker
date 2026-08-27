@@ -29,3 +29,5 @@ config.json
 *.exe
 *.apk
 *.xapk
+# 打包 venv（build_windows.bat）
+build_venv/
