@@ -1,0 +1,31 @@
+# 运行时二进制（含 JRE/apktool/apksigner/adb/debug.keystore），不进 git
+runtime/
+
+# 构建产物
+dist/
+dist_onefile/
+dist_full/
+build/
+build_full/
+build_onefile/
+build_pyi/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# PyInstaller
+*.spec
+
+# 密钥/凭证
+*.keystore
+*.jks
+config.json
+.env
+
+# 大文件/第三方 jar
+*.jar
+*.exe
+*.apk
+*.xapk
