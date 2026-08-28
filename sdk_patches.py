@@ -9,6 +9,7 @@
    （比 AI 兜底快且确定；AI 只兜底模板覆盖不到的）
 
 原则：只做文本级确定性替换；改不动的地方宁可跳过并提示，不赌。
+性能：apply_all 单次遍历全部 smali，每个文件只读一遍全文、做所有检查。
 """
 import os
 import re
@@ -135,7 +136,7 @@ _FILE_CACHE = {}
 
 
 def _iter_smali_files(outdir):
-    """列出全部 .smali 路径并缓存（三层补丁共享一份，省重复 os.walk I/O）。"""
+    """列出全部 .smali 路径并缓存（单次遍历共享一份，省重复 os.walk I/O）。"""
     if outdir not in _FILE_CACHE:
         files = []
         for root, _dirs, fs in os.walk(outdir):
@@ -173,17 +174,15 @@ def _method_true_body(header):
     return header, "\n    .locals 1\n\n    const/4 v0, 0x1\n\n    return v0\n"
 
 
-def _patch_getter_file(smali_path, class_desc, field, method_names, log, tag):
+# ---------------------------------------------------------------- 单文件补丁（纯函数，接受 txt 返回 (补丁数, new_txt)）
+
+def _patch_getter_text(txt, g, log, tag, rel):
     """把 isActive()Z 类 getter 的 iget-boolean 读点改成 const/4 1。"""
-    if not os.path.isfile(smali_path):
-        log("[%s] 文件不存在，跳过" % tag)
-        return 0
-    with open(smali_path, encoding="utf-8") as f:
-        lines = f.readlines()
+    lines = txt.splitlines(keepends=True)
     patched = 0
     in_method = False
     method_re = re.compile(
-        r"\.method.*\s(" + "|".join(re.escape(m) for m in method_names) + r")\(\)Z")
+        r"\.method.*\s(" + "|".join(re.escape(m) for m in g["methods"]) + r")\(\)Z")
     for i, line in enumerate(lines):
         if method_re.search(line):
             in_method = True
@@ -193,190 +192,114 @@ def _patch_getter_file(smali_path, class_desc, field, method_names, log, tag):
             continue
         if in_method:
             m = re.match(r"(\s*)iget-boolean\s+(\w+),\s*p\d+,\s*"
-                         + re.escape(class_desc) + r"->" + re.escape(field) + r":Z",
+                         + re.escape(g["class"]) + r"->" + re.escape(g["field"]) + r":Z",
                          line)
             if m:
                 lines[i] = "%sconst/4 %s, 0x1\n" % (m.group(1), m.group(2))
                 patched += 1
-                log("[%s] getter 恒 true: 行 %d" % (tag, i + 1))
+                log("[%s] getter 恒 true: %s 行 %d" % (tag, rel, i + 1))
     if patched:
-        _backup(smali_path)
-        with open(smali_path, "w", encoding="utf-8") as f:
-            f.writelines(lines)
-    else:
-        log("[%s] 未找到 getter 读点（SDK 版本差异？）" % tag)
-    return patched
+        return patched, "".join(lines)
+    return 0, txt
 
 
-def _patch_body_true_files(outdir, file_frag, method_re, log, tag):
-    """按文件名片段找 smali，把匹配的方法整体重写为恒 true。"""
-    patched = 0
+def _patch_body_true_text(txt, method_re, log, tag, rel):
+    """把匹配的方法整体重写为恒 true。"""
     mre = re.compile(method_re)
-    for p in _iter_smali_files(outdir):
-        fn = os.path.basename(p)
-        if file_frag not in fn:
-            continue
-        try:
-            with open(p, encoding="utf-8") as f:
-                txt = f.read()
-        except Exception:
-            continue
-        head, methods = _split_methods(txt)
-        changed = False
-        new_methods = []
-        for header, body in methods:
-            if mre.search(header):
-                nb = _method_true_body(header)
-                if nb is None:
-                    new_methods.append((header, body))
-                    continue
-                new_methods.append(nb)
-                patched += 1
-                changed = True
-                log("[%s] 方法恒 true: %s %s" % (tag, os.path.basename(p), header.strip()[:90]))
-            else:
+    head, methods = _split_methods(txt)
+    changed = False
+    new_methods = []
+    for header, body in methods:
+        if mre.search(header):
+            nb = _method_true_body(header)
+            if nb is None:
                 new_methods.append((header, body))
-        if changed:
-            _backup(p)
-            with open(p, "w", encoding="utf-8") as f:
-                f.write(_join_methods(head, new_methods))
-    if not patched:
-        log("[%s] 未找到匹配方法（SDK 版本差异？）" % tag)
-    return patched
-
-
-def patch_null_branches(outdir, signatures, log, tag="null 分支"):
-    """
-    通用 null 分支补丁：
-    对每个含调用签名（如 AccessLevel;->isActive()Z）的方法，找 move-result 寄存器，
-    在调用点后的窗口内找"null 路径"的赋值（move V, W / const/4 V, 0x0，W 为方法内
-    赋过 0 的寄存器），改成 const/4 V, 0x1。
-    """
-    frags = [s.lstrip("L") for s in signatures]
-    patched_files = 0
-    for p in _iter_smali_files(outdir):
-        try:
-            with open(p, encoding="utf-8") as f:
-                txt = f.read()
-        except Exception:
-            continue
-        if not any(frag in txt for frag in frags):
-            continue
-        head, methods = _split_methods(txt)
-        changed = False
-        out_methods = []
-        for header, body in methods:
-            if not any(frag in body for frag in frags):
-                out_methods.append((header, body))
                 continue
-            body_lines = body.splitlines(keepends=True)
-            # 本方法内被赋过 0 的寄存器
-            zero_regs = set(re.findall(r"const/4\s+(\w+),\s*0x?0\b", body))
-            hit = False
-            for i, line in enumerate(body_lines):
-                if not any(frag in line for frag in frags):
+            new_methods.append(nb)
+            changed = True
+            log("[%s] 方法恒 true: %s %s" % (tag, rel, header.strip()[:90]))
+        else:
+            new_methods.append((header, body))
+    if changed:
+        return 1, _join_methods(head, new_methods)
+    return 0, txt
+
+
+def _patch_null_text(txt, frags, log, tag, rel):
+    """
+    通用 null 分支补丁（单文件）：
+    对含调用签名（如 AccessLevel;->isActive()Z）的方法，找 move-result 寄存器，
+    在调用点后的窗口内找"null 路径"的赋值，改成 const/4 V, 0x1。
+    """
+    if not any(frag in txt for frag in frags):
+        return 0, txt
+    head, methods = _split_methods(txt)
+    changed = False
+    out_methods = []
+    for header, body in methods:
+        if not any(frag in body for frag in frags):
+            out_methods.append((header, body))
+            continue
+        body_lines = body.splitlines(keepends=True)
+        zero_regs = set(re.findall(r"const/4\s+(\w+),\s*0x?0\b", body))
+        hit = False
+        for i, line in enumerate(body_lines):
+            if not any(frag in line for frag in frags):
+                continue
+            res_reg = None
+            for j in range(i + 1, min(i + 6, len(body_lines))):
+                m2 = re.match(r"\s*move-result\s+(\w+)", body_lines[j])
+                if m2:
+                    res_reg = m2.group(1)
+                    break
+            if not res_reg:
+                continue
+            target_reg = res_reg
+            for j in range(i + 1, min(i + 45, len(body_lines))):
+                if "Boolean;->valueOf" in body_lines[j]:
+                    m7 = re.search(r"\{([^}]*)\}", body_lines[j])
+                    if m7:
+                        args = [a.strip() for a in m7.group(1).split(",") if a.strip()]
+                        if args:
+                            target_reg = args[0]
+                    break
+            end = min(i + 45, len(body_lines))
+            labels = set()
+            for wl in body_lines[i:end]:
+                m3 = re.match(r"\s*(:\w+)\s*$", wl)
+                if m3:
+                    labels.add(m3.group(1))
+            patched_line = False
+            for j in range(i, end - 1):
+                wl = body_lines[j]
+                m4 = re.match(r"\s*(:\w+)\s*$", wl)
+                if not m4 or m4.group(1) not in labels:
                     continue
-                # move-result 寄存器
-                res_reg = None
-                for j in range(i + 1, min(i + 6, len(body_lines))):
-                    m2 = re.match(r"\s*move-result\s+(\w+)", body_lines[j])
-                    if m2:
-                        res_reg = m2.group(1)
+                for k in range(j + 1, min(j + 4, len(body_lines))):
+                    t = body_lines[k]
+                    m5 = re.match(r"(\s*)move\s+(\w+),\s*(\w+)", t)
+                    if m5 and m5.group(2) == target_reg and m5.group(3) in zero_regs:
+                        body_lines[k] = "%sconst/4 %s, 0x1\n" % (m5.group(1), target_reg)
+                        patched_line = True
                         break
-                if not res_reg:
-                    continue
-                # 赋值目标寄存器：Boolean.valueOf 的入参（若有），否则 move-result 寄存器
-                target_reg = res_reg
-                for j in range(i + 1, min(i + 45, len(body_lines))):
-                    if "Boolean;->valueOf" in body_lines[j]:
-                        m7 = re.search(r"\{([^}]*)\}", body_lines[j])
-                        if m7:
-                            args = [a.strip() for a in m7.group(1).split(",") if a.strip()]
-                            if args:
-                                target_reg = args[0]
-                        break
-                # 窗口：调用点后 45 行（覆盖 valueOf / 跳转 / label）
-                end = min(i + 45, len(body_lines))
-                labels = set()
-                for wl in body_lines[i:end]:
-                    m3 = re.match(r"\s*(:\w+)\s*$", wl)
-                    if m3:
-                        labels.add(m3.group(1))
-                patched_line = False
-                for j in range(i, end - 1):
-                    wl = body_lines[j]
-                    m4 = re.match(r"\s*(:\w+)\s*$", wl)
-                    if not m4 or m4.group(1) not in labels:
-                        continue
-                    # label 后 3 行内找 null 赋值
-                    for k in range(j + 1, min(j + 4, len(body_lines))):
-                        t = body_lines[k]
-                        m5 = re.match(r"(\s*)move\s+(\w+),\s*(\w+)", t)
-                        if m5 and m5.group(2) == target_reg and m5.group(3) in zero_regs:
-                            body_lines[k] = "%sconst/4 %s, 0x1\n" % (m5.group(1), target_reg)
-                            patched_line = True
-                            break
-                        m6 = re.match(r"(\s*)const/4\s+(\w+),\s*0x?0\b", t)
-                        if m6 and m6.group(2) == target_reg:
-                            body_lines[k] = "%sconst/4 %s, 0x1\n" % (m6.group(1), target_reg)
-                            patched_line = True
-                            break
-                    if patched_line:
+                    m6 = re.match(r"(\s*)const/4\s+(\w+),\s*0x?0\b", t)
+                    if m6 and m6.group(2) == target_reg:
+                        body_lines[k] = "%sconst/4 %s, 0x1\n" % (m6.group(1), target_reg)
+                        patched_line = True
                         break
                 if patched_line:
-                    hit = True
-                    log("[%s] 恒 true: %s 行 %d（调用 %s）"
-                        % (tag, os.path.relpath(p, outdir), j + 2,
-                           [f for f in frags if f in line][0][:50]))
                     break
-            if hit:
-                changed = True
-            out_methods.append((header, "".join(body_lines)))
-        if changed:
-            _backup(p)
-            with open(p, "w", encoding="utf-8") as f:
-                f.write(_join_methods(head, out_methods))
-            patched_files += 1
-    if not patched_files:
-        log("[%s] 未定位到 null 分支（新用户 profile 无 premium level 时可能仍显示未订阅）" % tag)
-    return patched_files
+            if patched_line:
+                hit = True
+                log("[%s] 恒 true: %s 行 %d" % (tag, rel, j + 2))
+                break
+        out_methods.append((header, "".join(body_lines)))
+        if hit:
+            changed = True
+    if changed:
+        return 1, _join_methods(head, out_methods)
+    return 0, txt
 
-
-# ---------------------------------------------------------------- SDK 模板应用
-
-def apply_sdk_templates(outdir, log):
-    """按检测到的 SDK 应用确定性模板。返回 (sdk 列表, 补丁数)。"""
-    found = detect_sdks(outdir)
-    if not found:
-        return found, 0
-    log("[SDK] 检测到订阅 SDK: %s" % "、".join(found))
-    total = 0
-    for sdk in found:
-        tpl = SDK_TEMPLATES.get(sdk)
-        if not tpl:
-            continue
-        for g in tpl.get("getters", []):
-            # 按文件名找，且文件内容含类描述符（避免同名类误伤）
-            for p in _iter_smali_files(outdir):
-                if os.path.basename(p) != g["file"]:
-                    continue
-                try:
-                    with open(p, encoding="utf-8") as f:
-                        head = f.read(8192)
-                except Exception:
-                    continue
-                if g["class"] not in head:
-                    continue
-                total += _patch_getter_file(p, g["class"], g["field"],
-                                            g["methods"], log, sdk)
-        for b in tpl.get("body_true", []):
-            total += _patch_body_true_files(outdir, b["file"], b["method_re"], log, sdk)
-        if tpl.get("null_signatures"):
-            total += patch_null_branches(outdir, tpl["null_signatures"], log, sdk)
-    return found, total
-
-
-# ---------------------------------------------------------------- 缓存层规则（第 5 层）
 
 PREMIUM_KEY_RE = re.compile(
     r"(premium|is_?pro|vip|unlock|subscri|paid|entitle|active_?sub|adfree|"
@@ -384,68 +307,50 @@ PREMIUM_KEY_RE = re.compile(
     re.I)
 
 
-def patch_cache_flags(outdir, log):
+def _patch_cache_text(txt, log, rel):
     """
-    缓存层确定性补丁：
+    缓存层补丁（单文件）：
     const-string vS, "premium 相关 key" + SharedPreferences/FirebaseRemoteConfig
     的 getBoolean(...)Z + move-result vN → 把 vN 改成 const/4 1。
     """
-    patched = 0
-    # SharedPreferences: getBoolean(Ljava/lang/String;Z)Z（双参）
-    # FirebaseRemoteConfig: getBoolean(Ljava/lang/String;)Z（单参）
+    if "getBoolean" not in txt:
+        return 0, txt
     getbool_re = re.compile(r"->getBoolean\(Ljava/lang/String;Z?\)Z")
-    for p in _iter_smali_files(outdir):
-        try:
-            with open(p, encoding="utf-8") as f:
-                lines = f.readlines()
-        except Exception:
-            continue
-        changed = False
-        i = 0
-        while i < len(lines):
-            m = re.match(r'(\s*)const-string\s+(\w+),\s*"([^"]+)"', lines[i])
-            if not m or not PREMIUM_KEY_RE.search(m.group(3)):
-                i += 1
-                continue
-            key = m.group(3)
-            sreg = m.group(2)
-            # 之后 8 行内找 getBoolean 调用，且第一参数是 sreg
-            done = False
-            for j in range(i + 1, min(i + 9, len(lines))):
-                if not getbool_re.search(lines[j]):
-                    continue
-                args = re.search(r"\{([^}]*)\}", lines[j])
-                if not args:
-                    continue
-                arg_list = [a.strip() for a in args.group(1).split(",") if a.strip()]
-                # key 寄存器出现在参数列表任一位置即可（invoke-interface/static 是第一个，
-                # invoke-virtual 时 this 占第一个、key 是第二个）
-                if not arg_list or sreg not in arg_list:
-                    continue
-                # 之后 4 行内找 move-result
-                for k in range(j + 1, min(j + 5, len(lines))):
-                    m2 = re.match(r"(\s*)move-result\s+(\w+)", lines[k])
-                    if m2:
-                        lines[k] = "%sconst/4 %s, 0x1\n" % (m2.group(1), m2.group(2))
-                        patched += 1
-                        changed = True
-                        log("[缓存] %s -> true: %s 行 %d"
-                            % (key, os.path.relpath(p, outdir), k + 1))
-                        done = True
-                        break
-                if done:
-                    break
+    lines = txt.splitlines(keepends=True)
+    patched = 0
+    i = 0
+    while i < len(lines):
+        m = re.match(r'(\s*)const-string\s+(\w+),\s*"([^"]+)"', lines[i])
+        if not m or not PREMIUM_KEY_RE.search(m.group(3)):
             i += 1
-        if changed:
-            _backup(p)
-            with open(p, "w", encoding="utf-8") as f:
-                f.writelines(lines)
-    if not patched:
-        log("[缓存] 未发现 premium 相关本地缓存读点")
-    return patched
+            continue
+        key = m.group(3)
+        sreg = m.group(2)
+        done = False
+        for j in range(i + 1, min(i + 9, len(lines))):
+            if not getbool_re.search(lines[j]):
+                continue
+            args = re.search(r"\{([^}]*)\}", lines[j])
+            if not args:
+                continue
+            arg_list = [a.strip() for a in args.group(1).split(",") if a.strip()]
+            if not arg_list or sreg not in arg_list:
+                continue
+            for k in range(j + 1, min(j + 5, len(lines))):
+                m2 = re.match(r"(\s*)move-result\s+(\w+)", lines[k])
+                if m2:
+                    lines[k] = "%sconst/4 %s, 0x1\n" % (m2.group(1), m2.group(2))
+                    patched += 1
+                    log("[缓存] %s -> true: %s 行 %d" % (key, rel, k + 1))
+                    done = True
+                    break
+            if done:
+                break
+        i += 1
+    if patched:
+        return patched, "".join(lines)
+    return 0, txt
 
-
-# ---------------------------------------------------------------- 判断链扫描（第 2 层）
 
 BUSINESS_METHOD_RE = re.compile(
     r"\.method\s+[\w\s$]*?\s(isPremium|getIsPremium|isPremiumUser|isSubscribed|"
@@ -454,7 +359,6 @@ BUSINESS_METHOD_RE = re.compile(
     r"hasPro|canAccessPremium|premiumEnabled|isPremiumActive|isUserPremium)"
     r"\(([^)]*)\)Z", re.I)
 
-# 业务判断方法体内必须出现的"实质信号"（SDK 调用 / billing / 缓存读 / RC）
 SIGNAL_RE = re.compile(
     r"->(isActive|getIsActive|isSubscribed|hasActiveSubscription|isActiveSubscription|"
     r"isPremium|getIsPremium|hasPremium|isUnlocked|isAdFree)\(\)Z"
@@ -462,7 +366,6 @@ SIGNAL_RE = re.compile(
     r"|->getBoolean\(|launchBillingFlow|onPurchaseUpdated|BillingResult|getPurchases",
     re.I)
 
-# 判断链扫描跳过的目录（SDK 自身 / 系统 / 广告 SDK / 加固）
 SKIP_DIR_FRAGS = (
     "com/adapty/", "com/revenuecat/", "com/superwall/", "com/qonversion/",
     "com/apphud/", "com/google/", "com/android/", "androidx/", "kotlin/",
@@ -484,64 +387,115 @@ def _count_instructions(body_lines):
     return n
 
 
-def scan_business_reads(outdir, log, progress=None):
-    """
-    判断链扫描：业务代码（非 SDK/系统目录）里返回 boolean 的 premium 判断方法，
-    方法体短且含实质信号（SDK getter / billing / 缓存读）→ 恒 true。
-    """
-    patched = 0
-    files = [p for p in _iter_smali_files(outdir)
-             if not any(f in p.replace(os.sep, "/").lower() for f in SKIP_DIR_FRAGS)]
+def _patch_business_text(txt, log, rel):
+    """判断链扫描（单文件）：返回 boolean 的 premium 判断方法 → 恒 true。"""
+    if not SIGNAL_RE.search(txt):
+        return 0, txt
+    head, methods = _split_methods(txt)
+    changed = False
+    new_methods = []
+    for header, body in methods:
+        m = BUSINESS_METHOD_RE.search(header)
+        if not m or not SIGNAL_RE.search(body):
+            new_methods.append((header, body))
+            continue
+        if _count_instructions(body.splitlines()) > MAX_SCAN_METHOD_INSTRUCTIONS:
+            log("[判断链] 跳过（方法过长）: %s %s" % (rel, header.strip()[:80]))
+            new_methods.append((header, body))
+            continue
+        nb = _method_true_body(header)
+        if nb is None:
+            new_methods.append((header, body))
+            continue
+        new_methods.append(nb)
+        changed = True
+        log("[判断链] %s -> 恒 true: %s" % (m.group(1), rel))
+    if changed:
+        return 1, _join_methods(head, new_methods)
+    return 0, txt
+
+
+# ---------------------------------------------------------------- 总入口
+
+def apply_all(outdir, log, progress=None):
+    """单次遍历做全部确定性补丁（SDK 模板 / 缓存层 / 判断链），每个文件只读一遍。"""
+    found = detect_sdks(outdir)
+    if found:
+        log("[SDK] 检测到订阅 SDK: %s" % "、".join(found))
+    files = _iter_smali_files(outdir)
     total = max(1, len(files))
+    log("[补丁] 开始单次遍历扫描 %d 个 smali 文件 ..." % len(files))
+
+    # 预收集 SDK 模板参数
+    getter_targets = []   # (path, g, sdk)
+    body_targets = []     # (file_frag, method_re, sdk)
+    null_frags = []
+    for sdk in found:
+        tpl = SDK_TEMPLATES.get(sdk)
+        if not tpl:
+            continue
+        for g in tpl.get("getters", []):
+            for p in files:
+                if os.path.basename(p) == g["file"]:
+                    getter_targets.append((p, g, sdk))
+        body_targets.extend((b["file"], b["method_re"], sdk)
+                            for b in tpl.get("body_true", []))
+        null_frags.extend(s.lstrip("L") for s in tpl.get("null_signatures", []))
+
+    total_patched = 0
     for fi, p in enumerate(files, 1):
-        if progress and (fi == total or fi % 100 == 0):
+        if progress and fi % 200 == 0:
             progress(int(fi * 100 / total))
         try:
             with open(p, encoding="utf-8") as f:
                 txt = f.read()
         except Exception:
             continue
-        if not SIGNAL_RE.search(txt):
-            continue
-        head, methods = _split_methods(txt)
+        fn = os.path.basename(p)
+        rel = os.path.relpath(p, outdir).replace(os.sep, "/")
+        new_txt = txt
         changed = False
-        new_methods = []
-        for header, body in methods:
-            m = BUSINESS_METHOD_RE.search(header)
-            if not m or not SIGNAL_RE.search(body):
-                new_methods.append((header, body))
-                continue
-            if _count_instructions(body.splitlines()) > MAX_SCAN_METHOD_INSTRUCTIONS:
-                log("[判断链] 跳过（方法过长）: %s %s"
-                    % (os.path.relpath(p, outdir), header.strip()[:80]))
-                new_methods.append((header, body))
-                continue
-            nb = _method_true_body(header)
-            if nb is None:
-                new_methods.append((header, body))
-                continue
-            new_methods.append(nb)
-            patched += 1
+
+        # 1. SDK getter（按文件名 + class 描述符）
+        for path, g, sdk in getter_targets:
+            if path == p and g["class"] in new_txt[:8192]:
+                n, new_txt = _patch_getter_text(new_txt, g, log, sdk, rel)
+                if n:
+                    changed = True
+                    total_patched += n
+        # 2. SDK body_true（按文件名片段）
+        for frag, mre, sdk in body_targets:
+            if frag in fn:
+                n, new_txt = _patch_body_true_text(new_txt, mre, log, sdk, rel)
+                if n:
+                    changed = True
+                    total_patched += n
+        # 3. null 分支
+        if null_frags and any(frag in new_txt for frag in null_frags):
+            n, new_txt = _patch_null_text(new_txt, null_frags, log, "null 分支", rel)
+            if n:
+                changed = True
+                total_patched += n
+        # 4. 缓存层
+        n, new_txt = _patch_cache_text(new_txt, log, rel)
+        if n:
             changed = True
-            log("[判断链] %s -> 恒 true: %s" % (m.group(1), os.path.relpath(p, outdir)))
+            total_patched += n
+        # 5. 判断链（跳过 SDK/系统/广告目录）
+        if not any(f in rel.lower() for f in SKIP_DIR_FRAGS):
+            n, new_txt = _patch_business_text(new_txt, log, rel)
+            if n:
+                changed = True
+                total_patched += n
+
         if changed:
             _backup(p)
             with open(p, "w", encoding="utf-8") as f:
-                f.write(_join_methods(head, new_methods))
-    if not patched:
-        log("[判断链] 未发现可补丁的业务判断方法")
-    return patched
+                f.write(new_txt)
 
-
-# ---------------------------------------------------------------- 总入口
-
-def apply_all(outdir, log, progress=None):
-    """三层确定性补丁。返回 (检测到的 SDK 列表, 总补丁数)。"""
-    found, n1 = apply_sdk_templates(outdir, log)
-    if progress:
-        progress(40)
-    n2 = patch_cache_flags(outdir, log)
-    if progress:
-        progress(60)
-    n3 = scan_business_reads(outdir, log, progress)
-    return found, n1 + n2 + n3
+    if not total_patched:
+        log("[补丁] 确定性补丁无命中")
+    else:
+        log("[补丁] 确定性补丁完成: %d 处（SDK: %s）"
+            % (total_patched, "、".join(found) if found else "无"))
+    return found, total_patched
