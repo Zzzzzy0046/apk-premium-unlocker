@@ -689,21 +689,30 @@ def patch_pairip(outdir, log):
 
 
 def patch_force_single(outdir, log):
-    """强制单包模式：删除 manifest 的 splits-required 声明，让 base 单装。
-    警告：AAB 拆分的原生库/资源在 split 里，单装可能崩溃，仅作兜底。"""
+    """强制单包模式：删除 manifest 的 split 要求声明，让 base 单装。
+    AAB base 有 3 处 split 声明：splits.required meta-data、manifest 根元素的
+    requiredSplitTypes 属性、vending.splits meta-data。都要删。"""
     manifest = os.path.join(outdir, "AndroidManifest.xml")
     if not os.path.isfile(manifest):
         return
     with open(manifest, encoding="utf-8") as f:
         content = f.read()
-    if "com.android.vending.splits.required" not in content:
-        log("[单包] 未发现 splits-required 声明")
+    new = content
+    # 1. splits.required meta-data
+    new = re.sub(r'\s*<meta-data\s+android:name="com\.android\.vending\.splits\.required"[^>]*/>',
+                 "", new)
+    # 2. manifest 根元素的 requiredSplitTypes / splitTypes 属性（真正的 MISSING_SPLIT 元凶）
+    new = re.sub(r'\s+android:requiredSplitTypes="[^"]*"', "", new)
+    new = re.sub(r'\s+android:splitTypes="[^"]*"', "", new)
+    # 3. vending.splits meta-data（引用 @xml/splits0 的 split 配置）
+    new = re.sub(r'\s*<meta-data\s+android:name="com\.android\.vending\.splits"[^>]*/>',
+                 "", new)
+    if new == content:
+        log("[单包] 未发现 split 声明")
         return
-    new = re.sub(r"\s*<meta-data\s+android:name=\"com\.android\.vending\.splits\.required\"[^>]*/>",
-                 "", content)
     with open(manifest, "w", encoding="utf-8") as f:
         f.write(new)
-    log("[单包] 已删除 splits-required 声明，base 可单装")
+    log("[单包] 已删除全部 split 声明（splits.required + requiredSplitTypes + vending.splits），base 可单装")
     lib_dir = os.path.join(outdir, "lib")
     has_lib = any(fn.endswith(".so") for root, _, files in os.walk(lib_dir)
                   for fn in files) if os.path.isdir(lib_dir) else False
