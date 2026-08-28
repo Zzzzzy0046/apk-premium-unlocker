@@ -779,6 +779,15 @@ def install(adb, serial, pkg, signed_dir, log, progress=None):
     cmd += ["install-multiple"] + files
     log("安装 %d 个 APK ..." % len(files))
     ok = run_cmd(cmd, log, timeout=600)
+    if not ok:
+        # 增量安装偶发 session 问题（NO_MATCHING_ABIS / failed to finalize），
+        # 用 --no-incremental（传统 push+install）重试一次，更稳定
+        cmd2 = [adb]
+        if serial:
+            cmd2 += ["-s", serial]
+        cmd2 += ["install-multiple", "--no-incremental"] + files
+        log("增量安装失败，改用非增量安装重试 ...")
+        ok = run_cmd(cmd2, log, timeout=900)
     if progress:
         progress(ok and 100 or 90)
     if not ok:
