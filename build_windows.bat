@@ -22,7 +22,7 @@ python -m PyInstaller --onefile --windowed --clean --noconfirm ^
   --distpath dist_onefile ^
   --name "竞品订阅解锁工具" ^
   --hidden-import frida --collect-all frida ^
-  premium_unlocker.py || goto :err
+  launcher.py || goto :err
 
 echo [4/4] 合并内置 runtime（JRE/apktool/apksigner/adb）...
 python make_exe.py "dist_onefile\竞品订阅解锁工具.exe" runtime "dist\竞品订阅解锁工具.exe" || goto :err

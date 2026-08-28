@@ -553,10 +553,42 @@ def run_cmd(cmd, log, timeout=None):
         return False
 
 
+def _run_stream(cmd, log, timeout=None):
+    """流式运行子进程：逐行实时 log（apktool 进度可见），同时收集完整输出。
+    返回 (returncode, stdout+stderr 合并文本)。"""
+    echo = ("I:", "W:", "error", "Built apk", "Baksmaling", "Smaling",
+            "Checking", "Building", "Decoding", "not found")
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True, encoding="utf-8", errors="replace",
+                            creationflags=NO_WINDOW)
+    out = []
+    for line in iter(proc.stdout.readline, ""):
+        line = line.rstrip()
+        if line:
+            out.append(line)
+            if any(k in line for k in echo):
+                log("   " + line[:120])
+    try:
+        rc = proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        log("   [超时]")
+        return -1, "\n".join(out)
+    return rc, "\n".join(out)
+
+
 def decompile(apktool, base_apk, outdir, log):
     log("apktool 反编译（大包需要几分钟）...")
-    return run_cmd([find_java(), "-Xmx4g", "-jar", apktool, "d", base_apk, "-o", outdir, "-f"],
-                   log, timeout=900)
+    rc, out = _run_stream([find_java(), "-Xmx4g", "-jar", apktool, "d", base_apk,
+                           "-o", outdir, "-f"], log, timeout=900)
+    if rc == 0:
+        return True
+    for line in out.splitlines()[-6:]:
+        log("   [err] " + line[-140:])
+    return False
 
 
 def _inject_missing_attrs(outdir, names, log):
@@ -584,14 +616,13 @@ def _inject_missing_attrs(outdir, names, log):
 def build(apktool, outdir, repack, log, progress=None):
     log("apktool 重打包 ...")
     for attempt in range(6):
-        r = _run([find_java(), "-Xmx4g", "-jar", apktool, "b", outdir, "-o", repack],
-                 timeout=900)
-        if r.returncode == 0:
+        rc, out = _run_stream([find_java(), "-Xmx4g", "-jar", apktool, "b", outdir,
+                               "-o", repack], log, timeout=900)
+        if rc == 0:
             log("   已生成: %s" % repack)
             if progress:
                 progress(100)
             return True
-        out = (r.stdout or "") + (r.stderr or "")
         # 补丁写出非法 smali → 回滚 AI 补丁 + 确定性补丁后重试（pairip/资源补丁不受影响）
         if "Could not smali" in out or "no viable alternative" in out:
             n = ai_patch.rollback(log) + sdk_patches.rollback(log)
