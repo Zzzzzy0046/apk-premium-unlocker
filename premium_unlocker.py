@@ -592,10 +592,12 @@ def build(apktool, outdir, repack, log, progress=None):
                 progress(100)
             return True
         out = (r.stdout or "") + (r.stderr or "")
-        # AI 补丁写出非法 smali → 回滚 AI 补丁后重试（pairip/资源补丁不受影响）
-        if ("Could not smali" in out or "no viable alternative" in out) and ai_patch.rollback(log):
-            log("[资源修复] 已回滚 AI 补丁，重试重打包")
-            continue
+        # 补丁写出非法 smali → 回滚 AI 补丁 + 确定性补丁后重试（pairip/资源补丁不受影响）
+        if "Could not smali" in out or "no viable alternative" in out:
+            n = ai_patch.rollback(log) + sdk_patches.rollback(log)
+            if n:
+                log("[资源修复] 已回滚 %d 个补丁文件，重试重打包" % n)
+                continue
         missing = set(re.findall(r'attribute\s+([a-zA-Z0-9_]+)\s+\(aka', out))
         if missing and _inject_missing_attrs(outdir, missing, log):
             log("[资源修复] 补 %d 个缺失属性，重试 %d/%d" % (len(missing), attempt + 1, 6))

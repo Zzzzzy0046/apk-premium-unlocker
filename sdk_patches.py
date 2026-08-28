@@ -13,6 +13,38 @@
 import os
 import re
 
+# 已应用补丁的原文件备份（path -> 原内容），build 失败可回滚（对齐 ai_patch 的机制）
+BACKUP = {}
+
+
+def _backup(path):
+    """写文件前备份原内容（只备份一次）。"""
+    if path in BACKUP:
+        return
+    try:
+        with open(path, encoding="utf-8") as f:
+            BACKUP[path] = f.read()
+    except Exception:
+        pass
+
+
+def rollback(log=None):
+    """回滚所有确定性补丁（SDK 模板 / 缓存层 / 判断链）。返回回滚文件数。"""
+    if not BACKUP:
+        return 0
+    n = 0
+    for path, original in list(BACKUP.items()):
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(original)
+            n += 1
+        except Exception:
+            pass
+    BACKUP.clear()
+    if log:
+        log("[补丁] 已回滚 %d 个确定性补丁文件（补丁导致 smali 错误）" % n)
+    return n
+
 # ---------------------------------------------------------------- SDK 模板
 
 # 每个模板的补丁规则：
@@ -160,6 +192,7 @@ def _patch_getter_file(smali_path, class_desc, field, method_names, log, tag):
                 patched += 1
                 log("[%s] getter 恒 true: 行 %d" % (tag, i + 1))
     if patched:
+        _backup(smali_path)
         with open(smali_path, "w", encoding="utf-8") as f:
             f.writelines(lines)
     else:
@@ -196,6 +229,7 @@ def _patch_body_true_files(outdir, file_frag, method_re, log, tag):
             else:
                 new_methods.append((header, body))
         if changed:
+            _backup(p)
             with open(p, "w", encoding="utf-8") as f:
                 f.write(_join_methods(head, new_methods))
     if not patched:
@@ -291,6 +325,7 @@ def patch_null_branches(outdir, signatures, log, tag="null 分支"):
                 changed = True
             out_methods.append((header, "".join(body_lines)))
         if changed:
+            _backup(p)
             with open(p, "w", encoding="utf-8") as f:
                 f.write(_join_methods(head, out_methods))
             patched_files += 1
@@ -394,6 +429,7 @@ def patch_cache_flags(outdir, log):
                     break
             i += 1
         if changed:
+            _backup(p)
             with open(p, "w", encoding="utf-8") as f:
                 f.writelines(lines)
     if not patched:
@@ -408,7 +444,7 @@ BUSINESS_METHOD_RE = re.compile(
     r"getIsSubscribed|hasActiveSub|isActiveSubscription|hasEntitlement|isEntitled|"
     r"checkEntitlement|isPro|isVip|isUnlocked|isUnlock|isAdFree|isPaid|isPurchased|"
     r"hasPro|canAccessPremium|premiumEnabled|isPremiumActive|isUserPremium)"
-    r"\(([^)]*)\)(Z|\[?Z)", re.I)
+    r"\(([^)]*)\)Z", re.I)
 
 # 业务判断方法体内必须出现的"实质信号"（SDK 调用 / billing / 缓存读 / RC）
 SIGNAL_RE = re.compile(
@@ -481,6 +517,7 @@ def scan_business_reads(outdir, log, progress=None):
             changed = True
             log("[判断链] %s -> 恒 true: %s" % (m.group(1), os.path.relpath(p, outdir)))
         if changed:
+            _backup(p)
             with open(p, "w", encoding="utf-8") as f:
                 f.write(_join_methods(head, new_methods))
     if not patched:
