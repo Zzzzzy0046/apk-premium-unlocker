@@ -294,7 +294,7 @@ document.getElementById('start').onclick = async () => {
   if (!path) { alert('先选择或输入 APK / XAPK 文件路径'); return; }
   const frida = document.getElementById('frida').checked;
   const pkg = document.getElementById('pkg').value.trim();
-  if (frida && !pkg && !/\.(xapk|zip)$/i.test(path)) {
+  if (frida && !pkg && !/\\.(xapk|zip)$/i.test(path)) {
     alert('Frida 模式需要包名，请在输入框填写（如 com.xxx.yyy）');
     return;
   }

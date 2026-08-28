@@ -131,11 +131,19 @@ def detect_sdks(outdir):
 
 # ---------------------------------------------------------------- 基础补丁原语
 
+_FILE_CACHE = {}
+
+
 def _iter_smali_files(outdir):
-    for root, _dirs, files in os.walk(outdir):
-        for fn in files:
-            if fn.endswith(".smali"):
-                yield os.path.join(root, fn)
+    """列出全部 .smali 路径并缓存（三层补丁共享一份，省重复 os.walk I/O）。"""
+    if outdir not in _FILE_CACHE:
+        files = []
+        for root, _dirs, fs in os.walk(outdir):
+            for fn in fs:
+                if fn.endswith(".smali"):
+                    files.append(os.path.join(root, fn))
+        _FILE_CACHE[outdir] = files
+    return _FILE_CACHE[outdir]
 
 
 def _split_methods(txt):

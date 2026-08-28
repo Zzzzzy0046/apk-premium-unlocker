@@ -12,6 +12,8 @@ import json
 import zipfile
 import urllib.request
 
+import sdk_patches
+
 DEEPSEEK_URL = "https://api.deepseek.com/chat/completions"
 DEFAULT_MODEL = "deepseek-chat"
 CONFIG_FILE = os.path.join(
@@ -124,32 +126,7 @@ def has_ai():
 
 
 # ---------------------------------------------------------------- 上下文收集
-
-def detect_sdks(apktool_out, log):
-    """在 smali 目录树里找订阅相关 SDK。"""
-    found = []
-    markers = {
-        "adapty": "Adapty",
-        "revenuecat": "RevenueCat",
-        "billingclient": "Google Play Billing",
-        "apphud": "Apphud",
-        "qonversion": "Qonversion",
-        "adaptytech": "Adapty(api)",
-    }
-    for root, dirs, _files in os.walk(apktool_out):
-        base = root.replace(os.sep, "/").lower()
-        for k, v in markers.items():
-            if k in base and v not in found:
-                found.append(v)
-    log("[AI] 检测到 SDK: %s" % ("、".join(found) if found else "未知（直连 Billing 或自研）"))
-    return found
-
-
-def _iter_smali(apktool_out):
-    for root, _dirs, files in os.walk(apktool_out):
-        for fn in files:
-            if fn.endswith(".smali"):
-                yield os.path.join(root, fn)
+# SDK 检测与 smali 遍历统一复用 sdk_patches（避免两份 markers 不一致）
 
 
 def _premium_strings(apktool_out, limit=60):
@@ -205,7 +182,7 @@ def collect_candidates(apktool_out, log, max_files=16, ctx_bytes=70000, progress
     # 2) smali 多信号扫描，收集 (path, line, reason)
     hits = []  # (path, line_no, reason)
     log("[AI] 扫描 smali 订阅判断候选（多信号）...")
-    smali_files = list(_iter_smali(apktool_out))
+    smali_files = sdk_patches._iter_smali_files(apktool_out)
     total_files = max(1, len(smali_files))
     for fi, p in enumerate(smali_files, 1):
         try:
@@ -382,7 +359,8 @@ def run(apktool_out, log, progress=None):
         log("[AI] 未配置 DeepSeek Key，跳过")
         return False
     log("[AI] 开始 AI 订阅解锁分析（DeepSeek %s）..." % (cfg.get("model") or DEFAULT_MODEL))
-    sdks = detect_sdks(apktool_out, log)
+    sdks = sdk_patches.detect_sdks(apktool_out)
+    log("[AI] 检测到 SDK: %s" % ("、".join(sdks) if sdks else "未知（直连 Billing 或自研）"))
     parts, err = collect_candidates(apktool_out, log, progress=progress)
     if err:
         log("[AI] %s" % err)
